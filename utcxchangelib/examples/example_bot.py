@@ -100,8 +100,8 @@ class MyXchangeClient(xchange_client.XChangeClient):
 
 async def main(user_interface: bool):
     # SERVER = '127.0.0.1:8000'   # run locally
-    SERVER = '3.138.154.148:3333' # run on sandbox
-    my_client = MyXchangeClient(SERVER,"virginia_cornell_mit","j#N#Ab&39D")
+    SERVER = 'SERVER URL'
+    my_client = MyXchangeClient(SERVER,"USERNAME","PASSWORD")
     await my_client.start(user_interface)
     return
 
