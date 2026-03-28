@@ -53,10 +53,6 @@ class MyXchangeClient(XChangeClient):
             if subtype == "earnings":
                 asset = news_data["asset"]
                 value = news_data["value"]
-            elif subtype == "petition":
-                asset = news_data["asset"]
-                new_signatures = news_data["new_signatures"]
-                cumulative = news_data["cumulative"]
             elif subtype == "cpi_print":
                 forecast = news_data["forecast"]
                 actual = news_data["actual"]

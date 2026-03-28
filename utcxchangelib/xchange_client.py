@@ -318,13 +318,6 @@ class XChangeClient:
                     "asset": news_msg.structured.earnings.asset,
                     "structured_subtype": "earnings"
                 }
-            elif subtype == "petition":
-                news_release['new_data'] = {
-                    "new_signatures": news_msg.structured.petition.new_signatures,
-                    "cumulative": news_msg.structured.petition.cumulative,
-                    "asset": news_msg.structured.petition.asset,
-                    "structured_subtype": "petition"
-                }
             elif subtype == "cpi_print":
                 news_release['new_data'] = {
                     "forecast": news_msg.structured.cpi_print.forecast,
