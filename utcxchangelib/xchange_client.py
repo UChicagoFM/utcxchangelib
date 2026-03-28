@@ -29,7 +29,16 @@ DEFAULT_SWAP_MAP = {
     "fromETF": SwapInfo("fromETF", [("ETF", 1)], [("A", 1), ("B", 1), ("C", 1)], 5, True),
 }
 
-DEFAULT_SYMBOLS = ["A", "B", "C", "ETF", "R_CUT", "R_HOLD", "R_HIKE"]
+OPTION_STRIKES = [950, 1000, 1050]
+OPTION_SYMBOLS = [
+    f"B_{t}_{k}" for k in OPTION_STRIKES for t in ("C", "P")
+]
+
+DEFAULT_SYMBOLS = [
+    "A", "B", "C", "ETF",
+    *OPTION_SYMBOLS,
+    "R_CUT", "R_HOLD", "R_HIKE",
+]
 
 class Side(Enum):
     BUY = 1
