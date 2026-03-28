@@ -6,15 +6,9 @@ from enum import Enum
 import logging
 from dataclasses import dataclass, field
 from collections import defaultdict
-from typing import Optional
+from typing import Optional, Union
 import time
-import threading
-from utcxchangelib.phoenixhood_api import create_api
-import requests
-from typing import Union
-import queue
 import asyncio
-import concurrent.futures
 
 logging.basicConfig(level=logging.INFO)
 _LOGGER = logging.getLogger("xchange-client")
@@ -30,11 +24,12 @@ class SwapInfo:
     is_flat: bool
 
 
-# Make cost to create slightly lower than redeem?
-SWAP_MAP = {'toAKAV': SwapInfo('toAKAV', [('APT', 1), ('DLR', 1), ('MKJ', 1)], [('AKAV', 1)], 5, True),
-                'fromAKAV': SwapInfo('fromAKAV', [('AKAV', 1)], [('APT', 1), ('DLR', 1), ('MKJ', 1)], 5, True)}
+DEFAULT_SWAP_MAP = {
+    "toETF": SwapInfo("toETF", [("A", 1), ("B", 1), ("C", 1)], [("ETF", 1)], 5, True),
+    "fromETF": SwapInfo("fromETF", [("ETF", 1)], [("A", 1), ("B", 1), ("C", 1)], 5, True),
+}
 
-SYMBOLS = ["APT", "DLR", "MKJ", "AKAV", "AKIM"]
+DEFAULT_SYMBOLS = ["A", "B", "C", "ETF", "R_CUT", "R_HOLD", "R_HIKE"]
 
 class Side(Enum):
     BUY = 1
@@ -48,11 +43,19 @@ class OrderBook:
 
 class XChangeClient:
     """
-        A basic bot that can be used to interface with the 2025 UTC Xchange. Participants can
+        A basic bot that can be used to interface with the 2026 UTC Xchange. Participants can
         subclass this bot to implement specific functionality and trading logic.
     """
 
-    def __init__(self, host: str, username: str, password: str, silent: bool = False):
+    def __init__(
+        self,
+        host: str,
+        username: str,
+        password: str,
+        silent: bool = False,
+        symbols: Optional[list[str]] = None,
+        swap_map: Optional[dict[str, SwapInfo]] = None,
+    ):
         """ Initializes the bot
         :param host:        Host server where the exchange is being run
         :param username:    Participant's username
@@ -61,59 +64,25 @@ class XChangeClient:
         self.host = host
         self.username = username
         self.password = password
-        self.positions = defaultdict(int)
+        self.symbols = list(symbols or DEFAULT_SYMBOLS)
+        self.swap_map = dict(swap_map or DEFAULT_SWAP_MAP)
+        self.positions = defaultdict(int, {symbol: 0 for symbol in self.symbols} | {"cash": 0})
         self.open_orders = dict()
-        self.order_books = {sym: OrderBook() for sym in SYMBOLS}
-        self.order_id = int(time.time())  # start order id number from time
-        self.history = []
+        self.order_books = {sym: OrderBook() for sym in self.symbols}
+        self.order_id = int(time.time() * 1000)  # start order id number from time
         self.connected = False
         self.call = None
-        self.user_interface = False
-        self.to_exchange_queue = queue.Queue()
+        self.order_lock = asyncio.Lock()
         if silent:
             _LOGGER.setLevel(logging.WARNING)
 
-    def run_flask_api(self, client) -> None:
-
-        client.user_interface = True
-        app = create_api(client=client, symbology=SYMBOLS)
-        app.run(host="localhost", debug=False, threaded=True, port=6060)
-
-    def launch_user_interface(self) -> None:
-        """
-        Starts the phoenixhood API for user interactions.
-        """
-
-        flask_thread = threading.Thread(target=self.run_flask_api, args=[self])
-        flask_thread.start()
-
-    async def handle_queued_messages(self) -> None:
-        """
-        Task that sends messages added to the queue by the pheonixhood api to the exchange. 
-        It's an asyncio task of the bot that only runs if self.user_interface is true.
-        :return:
-        """
-
-        def blocking_get(q):
-            return q.get()
-
-        loop = asyncio.get_running_loop()
-
-        while True:
-            message = await loop.run_in_executor(None, blocking_get, self.to_exchange_queue) 
-            if message is None:
-                break
-            try:
-                if message['type'] == 'Order':
-                    await self.place_order(**message['data'])
-                if message['type'] == 'Swap':
-                    await self.place_swap_order(**message['data'])
-                if message['type'] == 'Cancel':
-                    for order_id in self.open_orders.keys():
-                        await self.cancel_order(order_id)
-            except Exception as e:
-                _LOGGER.error(f"Exception: {e}")
-                
+    def _ensure_symbol(self, symbol: str) -> None:
+        if symbol not in self.order_books:
+            self.order_books[symbol] = OrderBook()
+        if symbol not in self.positions:
+            self.positions[symbol] = 0
+        if symbol not in self.symbols:
+            self.symbols.append(symbol)
 
     async def connect(self) -> None:
         """
@@ -134,8 +103,6 @@ class XChangeClient:
             response = await self.call.read()
             await self.process_message(response)
 
-        await channel.close()
-
     async def place_order(self, symbol: str, qty: int, side: Union[Side, str], px: int = None) -> str:
         """ Function to place an order on the exchange. Places a market order if px is none, otherwise a limit order.
         :param symbol: Symbol for the order
@@ -146,25 +113,32 @@ class XChangeClient:
         """
 
         _LOGGER.info("Placing Order")
+        self._ensure_symbol(symbol)
 
         if isinstance(side, str):
             side = Side.BUY if side == "buy" else Side.SELL
 
         side = utc_bot_pb2.NewOrderRequest.Side.BUY if side == Side.BUY else utc_bot_pb2.NewOrderRequest.Side.SELL
         is_market = px is None
-        if is_market:
-            market_order_msg = utc_bot_pb2.MarketOrder(qty=qty)
-            order_request = utc_bot_pb2.NewOrderRequest(symbol=symbol, id=str(self.order_id), market=market_order_msg,
-                                                        side=side)
-        else:
-            limit_order_msg = utc_bot_pb2.LimitOrder(qty=qty, px=px)
-            order_request = utc_bot_pb2.NewOrderRequest(symbol=symbol, id=str(self.order_id), limit=limit_order_msg,
-                                                        side=side)
-        request = utc_bot_pb2.ClientMessageToExchange(new_order=order_request)
-        await self.call.write(request)
-        self.open_orders[str(self.order_id)] = [order_request, qty, is_market]
-        self.order_id += 1
-        return str(self.order_id - 1)
+        
+        async with self.order_lock:
+
+            if is_market:
+                market_order_msg = utc_bot_pb2.MarketOrder(qty=qty)
+                order_request = utc_bot_pb2.NewOrderRequest(symbol=symbol, id=str(self.order_id), market=market_order_msg,
+                                                            side=side)
+            else:
+                limit_order_msg = utc_bot_pb2.LimitOrder(qty=qty, px=px)
+                order_request = utc_bot_pb2.NewOrderRequest(symbol=symbol, id=str(self.order_id), limit=limit_order_msg,
+                                                            side=side)
+            request = utc_bot_pb2.ClientMessageToExchange(new_order=order_request)
+            await self.call.write(request)
+            self.open_orders[str(self.order_id)] = [order_request, qty, is_market]
+            self.order_id += 1
+
+            ret = self.order_id - 1
+
+        return str(ret)
 
     async def place_swap_order(self, swap: str, qty: int) -> None:
         """
@@ -188,6 +162,7 @@ class XChangeClient:
         await self.call.write(request)
 
     async def handle_trade_msg(self, msg):
+        self._ensure_symbol(msg.symbol)
         await self.bot_handle_trade_msg(msg.symbol, msg.px, msg.qty)
 
     async def handle_order_fill(self, msg) -> None:
@@ -198,6 +173,7 @@ class XChangeClient:
         """
         order_info: list = self.open_orders[msg.id]
         symbol: str = order_info[0].symbol
+        self._ensure_symbol(symbol)
         fill_qty: int = msg.qty
         fill_price: int = msg.px
         is_buy = order_info[0].side == utc_bot_pb2.NewOrderRequest.Side.BUY
@@ -210,10 +186,6 @@ class XChangeClient:
         else:
             _LOGGER.info("Order %s Partial Filled. %d remaining", msg.id, order_info[1])
 
-        # Update positions to API
-        if self.user_interface:
-            requests.post('http://localhost:6060/updates', json={'update_type': 'position_update', 'symbol': symbol})
-            requests.post('http://localhost:6060/updates', json={'update_type': 'position_update', 'symbol': "Cash"})
 
         await self.bot_handle_order_fill(msg.id, fill_qty, fill_price)
         # TODO: create an open order dataclass
@@ -252,18 +224,21 @@ class XChangeClient:
         swap_request = msg.request
         result_type = msg.WhichOneof('result')
         if result_type == 'ok':
-            swap: SwapInfo = SWAP_MAP[swap_request.name]
-            for from_name, from_qty in swap.from_info:
-                self.positions[from_name] -= from_qty * swap_request.qty
-            for to_name, to_qty in swap.to_info:
-                self.positions[to_name] += to_qty * swap_request.qty
-            self.positions['cash'] -= (1 if swap.is_flat else swap_request.qty) * swap.cost
-
-            # Update positions to api
-            if self.user_interface:
-                for symb, _ in swap.from_info + swap.to_info:
-                    requests.post('http://localhost:6060/updates', json={'update_type': 'position_update', 'symbol': symb})
-                requests.post('http://localhost:6060/updates', json={'update_type': 'position_update', 'symbol': "Cash"})
+            swap = self.swap_map.get(swap_request.name)
+            if swap is not None:
+                for from_name, from_qty in swap.from_info:
+                    self._ensure_symbol(from_name)
+                    self.positions[from_name] -= from_qty * swap_request.qty
+                for to_name, to_qty in swap.to_info:
+                    self._ensure_symbol(to_name)
+                    self.positions[to_name] += to_qty * swap_request.qty
+                self.positions['cash'] -= (1 if swap.is_flat else swap_request.qty) * swap.cost
+            else:
+                _LOGGER.warning(
+                    "Swap '%s' succeeded but is not in swap_map — local positions may be stale. "
+                    "Pass the correct swap_map to XChangeClient if you are using custom swaps.",
+                    swap_request.name,
+                )
 
             await self.bot_handle_swap_response(swap_request.name, swap_request.qty, True)
         else:
@@ -275,12 +250,11 @@ class XChangeClient:
         Update the books based on full snapshot from the exchange.
         :param msg: BookSnapshot message from the exchange
         """
+        self._ensure_symbol(msg.symbol)
         book = self.order_books[msg.symbol]
         book.bids = {bid.px: bid.qty for bid in msg.bids}
         book.asks = {ask.px: ask.qty for ask in msg.asks}
 
-        if self.user_interface:
-            requests.post('http://localhost:6060/updates', json={'update_type': 'book_snapshot', 'symbol': msg.symbol})
 
         await self.bot_handle_book_update(msg.symbol)
 
@@ -291,6 +265,7 @@ class XChangeClient:
         :param msg: BookUpdate
         """
 
+        self._ensure_symbol(msg.symbol)
         is_bid = msg.side == utc_bot_pb2.BookUpdate.Side.BUY
         book = self.order_books[msg.symbol].bids if is_bid else self.order_books[msg.symbol].asks
         if msg.px not in book:
@@ -298,23 +273,20 @@ class XChangeClient:
         else:
             book[msg.px] += msg.dq
 
-        # Triggers server side event to update book in user interface
-        if self.user_interface:
-            requests.post('http://localhost:6060/updates', json={'update_type': 'book_update', 'symbol': msg.symbol, "is_bid": is_bid})
-
         await self.bot_handle_book_update(msg.symbol)
 
     def handle_position_snapshot(self, msg) -> None:
         """Copy over positions from the exchange records"""
-        positions = {position.symbol: position.position for position in msg.positions}
+        positions = defaultdict(int)
+        _LOGGER.info(msg)
+        for position in msg.positions:
+            self._ensure_symbol(position.symbol)
+            positions[position.symbol] = position.position
         positions['cash'] = msg.cash
         self.positions = defaultdict(int, positions)
-        _LOGGER.info("Received Positions from server")
+        _LOGGER.info("Received Position snapshot from server")
         _LOGGER.info(self.positions)
 
-        # Update positions to API
-        if self.user_interface:
-            requests.post('http://localhost:6060/updates', json={'update_type': 'position_snapshot'})
 
     async def handle_news_message(self, news_msg):
         """
@@ -322,30 +294,41 @@ class XChangeClient:
         :param news_msg: NewsMessage
         """
         news_type = 'structured' if news_msg.HasField('structured') else 'unstructured'
-   
-        news_release = {'timestamp': news_msg.timestamp, 'kind': news_type}
+
+        news_release = {
+            'tick': news_msg.tick,
+            'kind': news_type,
+            'symbol': news_msg.symbol if news_msg.HasField('symbol') else None,
+        }
 
         if news_type == "structured":
-            if news_msg.structured.HasField("earnings"):
+            subtype = news_msg.structured.WhichOneof("subtype")
+            if subtype == "earnings":
                 news_release['new_data'] = {
                     "value": news_msg.structured.earnings.value,
                     "asset": news_msg.structured.earnings.asset,
                     "structured_subtype": "earnings"
                 }
-            else:
+            elif subtype == "petition":
                 news_release['new_data'] = {
                     "new_signatures": news_msg.structured.petition.new_signatures,
                     "cumulative": news_msg.structured.petition.cumulative,
                     "asset": news_msg.structured.petition.asset,
                     "structured_subtype": "petition"
                 }
+            elif subtype == "cpi_print":
+                news_release['new_data'] = {
+                    "forecast": news_msg.structured.cpi_print.forecast,
+                    "actual": news_msg.structured.cpi_print.actual,
+                    "structured_subtype": "cpi_print",
+                }
+            else:
+                news_release['new_data'] = {"structured_subtype": None}
         else:
             news_release["new_data"] = {
-                "content": news_msg.unstructured.content
+                "content": news_msg.unstructured.content,
+                "type": news_msg.unstructured.message_type
             }
-        
-        if self.user_interface:
-            requests.post('http://localhost:6060/updates', json={'update_type': "news_release", "data": news_release})
         
         await self.bot_handle_news(news_release)
 
@@ -416,7 +399,7 @@ class XChangeClient:
         """
         pass
 
-    async def bot_handle_news(self, timestamp: int, news_release: dict):
+    async def bot_handle_news(self, news_release: dict):
         """
         Function for the user to fill in if they want to have any actions upon receiving
         a new release.
@@ -424,6 +407,14 @@ class XChangeClient:
         :param news:    Dictionary containing data for news.
         :return:
         """
+        pass
+
+    async def bot_handle_market_resolved(self, market_id: str, winning_symbol: str, tick: int):
+        """Hook for prediction market resolution events."""
+        pass
+
+    async def bot_handle_settlement_payout(self, user: str, market_id: str, amount: int, tick: int):
+        """Hook for settlement payout events."""
         pass
 
     def handle_authenticate_response(self, msg):
@@ -447,8 +438,11 @@ class XChangeClient:
             exit(0)
 
         msg_type = msg.WhichOneof('body')
-        if msg_type not in ("book_snapshot", "book_update", "trade"):
-            _LOGGER.info("Receieved message of type %s. index %d", msg_type, msg.index)
+        if msg_type is None:
+            _LOGGER.debug("Received message with unknown body variant at index %d — proto stubs may need regenerating", msg.index)
+            return
+        if msg_type not in ("book_snapshot", "book_update", "trade", "cash_update", "position_update"):
+            _LOGGER.info("Received message of type %s. index %d", msg_type, msg.index)
         if msg_type == "authenticated":
             self.handle_authenticate_response(msg.authenticated)
         elif msg_type == 'trade':
@@ -469,6 +463,24 @@ class XChangeClient:
             self.handle_position_snapshot(msg.position_snapshot)
         elif msg_type == 'news_event':
             await self.handle_news_message(msg.news_event)
+        elif msg_type == 'market_resolved':
+            await self.bot_handle_market_resolved(
+                msg.market_resolved.market_id,
+                msg.market_resolved.winning_symbol,
+                msg.market_resolved.tick,
+            )
+        elif msg_type == 'settlement_payout':
+            await self.bot_handle_settlement_payout(
+                msg.settlement_payout.user,
+                msg.settlement_payout.market_id,
+                msg.settlement_payout.amount,
+                msg.settlement_payout.tick,
+            )
+        elif msg_type == 'cash_update':
+            self.positions['cash'] = msg.cash_update.value
+        elif msg_type == 'position_update':
+            self._ensure_symbol(msg.position_update.symbol)
+            self.positions[msg.position_update.symbol] = msg.position_update.value
         elif msg_type == 'error':
             _LOGGER.error(msg.error)
         return
