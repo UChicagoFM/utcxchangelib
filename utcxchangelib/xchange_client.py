@@ -156,6 +156,7 @@ class XChangeClient:
         :param qty: Quantity of swaps to execute
         :return:
         """
+        _LOGGER.info("Placing Swap Order: %s, qty: %d", swap, qty)
         swap_request = utc_bot_pb2.SwapRequest(name=swap, qty=qty)
         request = utc_bot_pb2.ClientMessageToExchange(swap=swap_request)
         await self.call.write(request)
@@ -180,21 +181,22 @@ class XChangeClient:
         :param msg: OrderFillMessage from exchange
         :return:
         """
-        order_info: list = self.open_orders[msg.id]
+        order_info: list = self.open_orders.get(msg.id, [])
+        if not order_info:
+            _LOGGER.debug("Received fill for order id %s not in open orders - likely due to click trade")
+            return
+
         symbol: str = order_info[0].symbol
         self._ensure_symbol(symbol)
         fill_qty: int = msg.qty
         fill_price: int = msg.px
         is_buy = order_info[0].side == utc_bot_pb2.NewOrderRequest.Side.BUY
-        self.positions[symbol] += fill_qty * (1 if is_buy else -1)
-        self.positions['cash'] += fill_qty * fill_price * (-1 if is_buy else 1)
 
         order_info[1] -= fill_qty
         if order_info[1] == 0:
-            _LOGGER.info("Order %s Completely Filled", (msg.id))
+            _LOGGER.info("Order %s Completely Filled (%s %d @ %d)", msg.id, "BUY" if is_buy else "SELL", fill_qty, fill_price)
         else:
-            _LOGGER.info("Order %s Partial Filled. %d remaining", msg.id, order_info[1])
-
+            _LOGGER.info("Order %s Partial Filled (%s %d @ %d). %d remaining", msg.id, "BUY" if is_buy else "SELL", fill_qty, fill_price, order_info[1])
 
         await self.bot_handle_order_fill(msg.id, fill_qty, fill_price)
         # TODO: create an open order dataclass
@@ -206,6 +208,8 @@ class XChangeClient:
         Calls the users order rejection handler and then removes it from the open orders.
         :param msg: Order Rejected Message
         """
+        if msg.id not in self.open_orders:
+            return
         await self.bot_handle_order_rejected(msg.id, msg.reason)
         self.open_orders.pop(msg.id)
 
@@ -215,6 +219,8 @@ class XChangeClient:
         :param msg:
         :return:
         """
+        if msg.id not in self.open_orders:
+            return
         result_type = msg.WhichOneof('result')
         if result_type == 'ok':
             _LOGGER.info("Cancel order %s successful.", msg.id)
@@ -234,21 +240,12 @@ class XChangeClient:
         result_type = msg.WhichOneof('result')
         if result_type == 'ok':
             swap = self.swap_map.get(swap_request.name)
-            if swap is not None:
-                for from_name, from_qty in swap.from_info:
-                    self._ensure_symbol(from_name)
-                    self.positions[from_name] -= from_qty * swap_request.qty
-                for to_name, to_qty in swap.to_info:
-                    self._ensure_symbol(to_name)
-                    self.positions[to_name] += to_qty * swap_request.qty
-                self.positions['cash'] -= (1 if swap.is_flat else swap_request.qty) * swap.cost
-            else:
+            if swap is None:
                 _LOGGER.warning(
                     "Swap '%s' succeeded but is not in swap_map — local positions may be stale. "
                     "Pass the correct swap_map to XChangeClient if you are using custom swaps.",
                     swap_request.name,
                 )
-
             await self.bot_handle_swap_response(swap_request.name, swap_request.qty, True)
         else:
             await self.bot_handle_swap_response(swap_request.name, swap_request.qty, False)
