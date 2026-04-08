@@ -81,7 +81,7 @@ class XChangeClient:
         self.order_id = int(time.time() * 1000)  # start order id number from time
         self.connected = False
         self.call = None
-        self.order_lock = asyncio.Lock()
+        self.write_lock = asyncio.Lock()
         if silent:
             _LOGGER.setLevel(logging.WARNING)
 
@@ -129,9 +129,8 @@ class XChangeClient:
 
         side = utc_bot_pb2.NewOrderRequest.Side.BUY if side == Side.BUY else utc_bot_pb2.NewOrderRequest.Side.SELL
         is_market = px is None
-        
-        async with self.order_lock:
 
+        async with self.write_lock:
             if is_market:
                 market_order_msg = utc_bot_pb2.MarketOrder(qty=qty)
                 order_request = utc_bot_pb2.NewOrderRequest(symbol=symbol, id=str(self.order_id), market=market_order_msg,
@@ -157,9 +156,10 @@ class XChangeClient:
         :return:
         """
         _LOGGER.info("Placing Swap Order: %s, qty: %d", swap, qty)
-        swap_request = utc_bot_pb2.SwapRequest(name=swap, qty=qty)
-        request = utc_bot_pb2.ClientMessageToExchange(swap=swap_request)
-        await self.call.write(request)
+        async with self.write_lock:
+            swap_request = utc_bot_pb2.SwapRequest(name=swap, qty=qty)
+            request = utc_bot_pb2.ClientMessageToExchange(swap=swap_request)
+            await self.call.write(request)
 
     async def cancel_order(self, order_id: str) -> None:
         """ Places a cancel order request for the given order id
@@ -167,9 +167,10 @@ class XChangeClient:
         :return:
         """
         _LOGGER.info("Requesting to cancel order: %s", order_id)
-        cancel_request = utc_bot_pb2.CancelOrderRequest(id=order_id)
-        request = utc_bot_pb2.ClientMessageToExchange(cancel_order=cancel_request)
-        await self.call.write(request)
+        async with self.write_lock:
+            cancel_request = utc_bot_pb2.CancelOrderRequest(id=order_id)
+            request = utc_bot_pb2.ClientMessageToExchange(cancel_order=cancel_request)
+            await self.call.write(request)
 
     async def handle_trade_msg(self, msg):
         self._ensure_symbol(msg.symbol)
