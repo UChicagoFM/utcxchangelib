@@ -38,6 +38,7 @@ DEFAULT_SYMBOLS = [
     "A", "B", "C", "ETF",
     *OPTION_SYMBOLS,
     "R_CUT", "R_HOLD", "R_HIKE",
+    "FILL_1", "FILL_2", "FILL_3", "FILL_4"
 ]
 
 class Side(Enum):
